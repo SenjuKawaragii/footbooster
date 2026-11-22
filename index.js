@@ -182,6 +182,8 @@ function deepMerge(a, b) {
   return o;
 }
 const accKey = n => String(n || '').normalize('NFKC').toLowerCase().replace(/\s+/g, ' ').trim();
+const SECRET = process.env.FOOTBOOSTER_SECRET || TCP_URL || REST_TOKEN || 'foot-boosters';
+const sign = uid => crypto.createHmac('sha256', SECRET).update('tok:' + uid).digest('hex').slice(0, 32);
 const newEtag = len => crypto.randomBytes(4).toString('hex') + '.' + len;
 
 function fail(status, code, message) { const e = new Error(message || code); e.status = status; e.code = code; return e; }
@@ -227,7 +229,7 @@ async function opEnter(body, ip) {
       if (n === 1) await cmd('EXPIRE', rl, 900);
       throw fail(401, 'wrong_password', 'Mot de passe incorrect.');
     }
-    await cmd('DEL', rl);
+    try { await cmd('DEL', rl); } catch (e) { /* sans importance */ }
   } else {
     const salt = crypto.randomBytes(16);
     const hash = await scrypt(pass, salt);
@@ -235,16 +237,23 @@ async function opEnter(body, ip) {
     acc = { uid: 'u' + crypto.randomBytes(6).toString('hex'), name, salt: salt.toString('hex'), hash: hash.toString('hex'), t: Date.now() };
     const made = await cmd('HSETNX', 'fb:acc', key, JSON.stringify(acc));
     if (!made) return opEnter(body, ip); // quelqu'un l'a créé juste avant : on se reconnecte
-    await run([['HSET', 'fb:uname', acc.uid, acc.name], ['SETNX', 'fb:owner', acc.uid]]);
+    await run([['HSET', 'fb:uname', acc.uid, acc.name], ['HSET', 'fb:ulogin', acc.uid, acc.name], ['HSETNX', 'fb:dn', key, acc.uid], ['SETNX', 'fb:owner', acc.uid]]);
   }
-  const tok = 'fbt_' + crypto.randomBytes(24).toString('hex');
-  await cmd('HSET', 'fb:tok', tok, acc.uid);
-  return { tok, uid: acc.uid, name: acc.name };
+  // écritures annexes « au mieux » : une base pleine ne doit pas empêcher de se connecter
+  try { await run([['HSETNX', 'fb:ulogin', acc.uid, acc.name], ['HSETNX', 'fb:dn', key, acc.uid], ['HSETNX', 'fb:uname', acc.uid, acc.name]]); } catch (e) { /* sans importance */ }
+  return { tok: 'fbt_' + acc.uid + '_' + sign(acc.uid), uid: acc.uid, name: acc.name };
 }
 
 async function auth(token) {
-  if (!token || typeof token !== 'string' || token.length > 100 || !/^fbt_[0-9a-f]+$/.test(token)) throw fail(401, 'unauthorized', 'Connexion requise.');
-  const uid = await cmd('HGET', 'fb:tok', token);
+  if (!token || typeof token !== 'string' || token.length > 120) throw fail(401, 'unauthorized', 'Connexion requise.');
+  const m = /^fbt_(u[0-9a-f]{12})_([0-9a-f]{32})$/.exec(token);
+  if (m) { // jeton signé : aucune lecture ni écriture dans Redis
+    const a = Buffer.from(sign(m[1])), b = Buffer.from(m[2]);
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) return m[1];
+    throw fail(401, 'unauthorized', 'Session invalide : reconnecte-toi.');
+  }
+  if (!/^fbt_[0-9a-f]+$/.test(token)) throw fail(401, 'unauthorized', 'Connexion requise.');
+  const uid = await cmd('HGET', 'fb:tok', token); // anciens jetons (avant la mise à jour)
   if (!uid) throw fail(401, 'unauthorized', 'Session expirée : reconnecte-toi.');
   return uid;
 }
@@ -329,8 +338,22 @@ async function handle(op, body, token, ip) {
   const uid = await auth(token);
   switch (op) {
     case 'me': {
-      const [name, owner] = await run([['HGET', 'fb:uname', uid], ['GET', 'fb:owner']]);
-      return { uid, name: name || '', owner: owner === uid };
+      const [name, login, owner] = await run([['HGET', 'fb:uname', uid], ['HGET', 'fb:ulogin', uid], ['GET', 'fb:owner']]);
+      return { uid, name: name || login || '', login: login || name || '', owner: owner === uid };
+    }
+    case 'rename': {
+      const nm = String(body.name || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+      if (nm.length < 2 || nm.length > 20) throw fail(400, 'bad_request', 'Le pseudo doit faire entre 2 et 20 caractères.');
+      const key = accKey(nm);
+      if (key === 'legit') throw fail(400, 'bad_request', 'Ce pseudo est réservé.');
+      const acc = await cmd('HGET', 'fb:acc', key);
+      if (acc && JSON.parse(acc).uid !== uid) throw fail(409, 'name_taken', 'Ce pseudo est déjà pris.');
+      const claimed = await cmd('HSETNX', 'fb:dn', key, uid);
+      if (!claimed && (await cmd('HGET', 'fb:dn', key)) !== uid) throw fail(409, 'name_taken', 'Ce pseudo est déjà pris.');
+      const old = await cmd('HGET', 'fb:uname', uid);
+      await cmd('HSET', 'fb:uname', uid, nm);
+      if (old && accKey(old) !== key && (await cmd('HGET', 'fb:dn', accKey(old))) === uid) await cmd('HDEL', 'fb:dn', accKey(old));
+      return { name: nm };
     }
     case 'names': {
       const ids = (Array.isArray(body.ids) ? body.ids : []).filter(i => typeof i === 'string' && SEG.test(i)).slice(0, 100);
@@ -380,7 +403,18 @@ module.exports = async function handler(req, res) {
     if (req.method === 'GET') {
       if (url.searchParams.get('ping')) {
         if (!HAS_REST && !TCP_URL) return send(res, 200, { ok: false, code: 'no_redis' });
-        try { await cmd('PING'); return send(res, 200, { ok: true }); }
+        try {
+          await cmd('PING');
+          const info = { ok: true };
+          try { // diagnostic : nombre de cartes sur le serveur et mémoire utilisée
+            const [n, mem] = await run([['HLEN', 'fb:d:cards'], ['INFO', 'memory']]);
+            info.cards = Number(n) || 0;
+            const g = k => { const m = String(mem || '').match(new RegExp(k + ':(\\d+)')); return m ? Number(m[1]) : 0; };
+            info.usedMB = +(g('used_memory') / 1048576).toFixed(1);
+            if (g('maxmemory')) info.maxMB = +(g('maxmemory') / 1048576).toFixed(1);
+          } catch (e) { /* INFO peut être désactivé : sans importance */ }
+          return send(res, 200, info);
+        }
         catch (e) { console.error('[api] ping Redis :', e && e.message); return send(res, 200, { ok: false, code: 'unavailable' }); }
       }
       return send(res, 405, { code: 'method_not_allowed' });
