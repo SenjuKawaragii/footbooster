@@ -1,8 +1,5 @@
 {
-  "name": "foot-booster-vercel",
+  "name": "foot-boosters",
   "version": "1.0.0",
-  "private": true,
-  "dependencies": {
-    "redis": "^4.7.0"
-  }
+  "private": true
 }
