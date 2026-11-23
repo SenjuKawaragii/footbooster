@@ -265,7 +265,9 @@ async function opPoll(body, uid) {
   const allStarted = paths.every(p => isObj(subs[p]));
   if (!body.force && allStarted && body.ver === ver) return { same: true, ver };
 
-  const ok = paths.filter(p => canRead(p, uid));
+  // les petites collections (joueurs, amis…) d'abord : elles arrivent tout de suite, les lourdes ensuite
+  const heavy = p => (p === 'cards' || p.startsWith('data/users/') ? 1 : 0);
+  const ok = paths.filter(p => canRead(p, uid)).sort((a, b) => heavy(a) - heavy(b));
   const etagRes = await run(ok.map(p => ['HGETALL', 'fb:e:' + p]));
   const BUDGET = 3000000;           // taille max d'une réponse (limite Vercel : 4,5 Mo)
   let used = 0, more = false;
@@ -277,18 +279,19 @@ async function opPoll(body, uid) {
     Object.keys(et).forEach(id => { if (want[id] !== et[id]) need.push(id); });
     Object.keys(want).forEach(id => { if (!(id in et)) del.push(id); });
     const take = [];
+    let truncated = false;
     for (const id of need) {
       const sz = parseInt(String(et[id]).split('.')[1], 10) || 1000;
-      if (used > 0 && used + sz > BUDGET) { more = true; break; }
+      if (used > 0 && used + sz > BUDGET) { more = true; truncated = true; break; }
       used += sz; take.push(id);
     }
-    plan[p] = { et, take, del };
+    plan[p] = { et, take, del, more: truncated };
     if (take.length) { getCmds.push(['HMGET', 'fb:d:' + p].concat(take)); getPaths.push(p); }
   });
   const got = await run(getCmds);
   const cols = {}, orphans = [];
   paths.forEach(p => { cols[p] = { docs: {}, etags: {}, del: [] }; });
-  ok.forEach(p => { cols[p].del = plan[p].del; });
+  ok.forEach(p => { cols[p].del = plan[p].del; cols[p].more = plan[p].more; });
   getPaths.forEach((p, i) => {
     plan[p].take.forEach((id, k) => {
       const v = got[i] && got[i][k];
