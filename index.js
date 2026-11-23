@@ -157,7 +157,7 @@ const flatToObj = f => { const o = {}; for (let i = 0; i + 1 < (f || []).length;
 
 /* ---------------------------------------------------------------- Helpers */
 const SEG = /^[A-Za-z0-9_.:~@+-]{1,200}$/;
-const SHARED = new Set(['cards', 'clubs']);                 // catalogue partagé : tout joueur connecté peut écrire
+const SHARED = new Set(['cards', 'clubs', 'tomb']);                 // catalogue partagé : tout joueur connecté peut écrire
 const PERUSER = new Set(['pub', 'pcol', 'fr', 'mk', 'out', 'rp']); // un document par joueur : lui seul écrit
 const isObj = v => v && typeof v === 'object' && !Array.isArray(v);
 
@@ -286,15 +286,17 @@ async function opPoll(body, uid) {
     if (take.length) { getCmds.push(['HMGET', 'fb:d:' + p].concat(take)); getPaths.push(p); }
   });
   const got = await run(getCmds);
-  const cols = {};
+  const cols = {}, orphans = [];
   paths.forEach(p => { cols[p] = { docs: {}, etags: {}, del: [] }; });
   ok.forEach(p => { cols[p].del = plan[p].del; });
   getPaths.forEach((p, i) => {
     plan[p].take.forEach((id, k) => {
       const v = got[i] && got[i][k];
       if (v) { try { cols[p].docs[id] = JSON.parse(v); cols[p].etags[id] = plan[p].et[id]; } catch (e) { /* document illisible : ignoré */ } }
+      else orphans.push(['HDEL', 'fb:e:' + p, id]); // empreinte sans document : on la supprime
     });
   });
+  if (orphans.length) { try { await run(orphans.concat([['INCR', 'fb:v']])); } catch (e) { /* sans importance */ } }
   return { cols, more, ver };
 }
 
@@ -339,7 +341,7 @@ async function handle(op, body, token, ip) {
   switch (op) {
     case 'me': {
       const [name, login, owner] = await run([['HGET', 'fb:uname', uid], ['HGET', 'fb:ulogin', uid], ['GET', 'fb:owner']]);
-      return { uid, name: name || login || '', login: login || name || '', owner: owner === uid };
+      return { uid, name: String(name || login || 'Joueur'), login: String(login || name || 'Joueur'), owner: owner === uid };
     }
     case 'rename': {
       const nm = String(body.name || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
