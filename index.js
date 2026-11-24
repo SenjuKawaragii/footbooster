@@ -269,7 +269,7 @@ async function opPoll(body, uid) {
   const heavy = p => (p === 'cards' || p.startsWith('data/users/') ? 1 : 0);
   const ok = paths.filter(p => canRead(p, uid)).sort((a, b) => heavy(a) - heavy(b));
   const etagRes = await run(ok.map(p => ['HGETALL', 'fb:e:' + p]));
-  const BUDGET = 3000000;           // taille max d'une réponse (limite Vercel : 4,5 Mo)
+  const BUDGET = 1800000;           // taille max d'une réponse (limite Vercel : 4,5 Mo ; plus petit = plus rapide)
   let used = 0, more = false;
   const plan = {}, getCmds = [], getPaths = [];
   ok.forEach((p, i) => {
@@ -367,6 +367,19 @@ async function handle(op, body, token, ip) {
       return { names };
     }
     case 'poll': return opPoll(body, uid);
+    case 'purge': { // supprime les anciennes copies des cartes du site (identiques à celles du fichier du site)
+      const items = isObj(body.items) ? body.items : {};
+      const ids = Object.keys(items).filter(i => SEG.test(i)).slice(0, 150);
+      if (!ids.length) return { deleted: 0 };
+      const docs = await cmd('HMGET', 'fb:d:cards', ...ids);
+      const del = [];
+      ids.forEach((id, i) => {
+        if (!docs || !docs[i]) return;
+        try { const d = JSON.parse(docs[i]); if ([d.name, d.team, d.rating].join('|') === String(items[id])) del.push(id); } catch (e) { /* illisible : on garde */ }
+      });
+      if (del.length) await writeDocs(del.map(id => ({ coll: 'cards', id, data: null })));
+      return { deleted: del.length };
+    }
     default: return opWrite(op, body, uid);
   }
 }
