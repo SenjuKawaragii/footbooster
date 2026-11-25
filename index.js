@@ -97,8 +97,13 @@ function openConn() {
   c.sock.on('data', d => { c.buf = c.buf.length ? Buffer.concat([c.buf, d]) : d; drain(c); });
   c.sock.on('error', e => c.kill(e));
   c.sock.on('close', () => c.kill());
+  c.used = Date.now();
   c.init = (async () => {
-    await new Promise((res, rej) => { c.sock.once(secure ? 'secureConnect' : 'connect', res); c.sock.once('error', rej); });
+    await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(Object.assign(new Error('connexion Redis trop lente'), { conn: true })), 3500);
+      c.sock.once(secure ? 'secureConnect' : 'connect', () => { clearTimeout(t); res(); });
+      c.sock.once('error', e => { clearTimeout(t); rej(e); });
+    });
     const user = decodeURIComponent(u.username || ''), pass = decodeURIComponent(u.password || '');
     const db = parseInt((u.pathname || '').slice(1), 10);
     if (pass) await Promise.all(execMany(c, [user && user !== 'default' ? ['AUTH', user, pass] : ['AUTH', pass]]));
@@ -110,11 +115,12 @@ function openConn() {
 async function tcpRun(cmds, retry) {
   let c;
   try {
+    if (conn && !conn.dead && Date.now() - conn.used > 15000) conn.kill(new Error('connexion inactive')); // elle a pu mourir pendant que l'instance dormait
     if (!conn || conn.dead) conn = openConn();
     c = conn;
     await c.init;
-    const timer = setTimeout(() => c.kill(new Error('Redis ne répond pas')), 10000);
-    try { return await Promise.all(execMany(c, cmds)); } finally { clearTimeout(timer); }
+    const timer = setTimeout(() => c.kill(new Error('Redis ne répond pas')), 4000);
+    try { const r = await Promise.all(execMany(c, cmds)); c.used = Date.now(); return r; } finally { clearTimeout(timer); }
   } catch (e) {
     if (e && e.conn && !retry) return tcpRun(cmds, true); // connexion périmée (instance endormie) : on réessaie une fois
     throw e;
@@ -422,8 +428,9 @@ module.exports = async function handler(req, res) {
       if (url.searchParams.get('ping')) {
         if (!HAS_REST && !TCP_URL) return send(res, 200, { ok: false, code: 'no_redis' });
         try {
+          const t0 = Date.now();
           await cmd('PING');
-          const info = { ok: true };
+          const info = { ok: true, ms: Date.now() - t0 };
           try { // diagnostic : nombre de cartes sur le serveur et mémoire utilisée
             const [n, mem] = await run([['HLEN', 'fb:d:cards'], ['INFO', 'memory']]);
             info.cards = Number(n) || 0;
