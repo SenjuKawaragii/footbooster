@@ -1,6 +1,6 @@
 'use strict';
 /*
-  Foot Boosters — route /api pour Vercel.
+  Foot Boosters — route /api/fb pour Vercel (fichier : api/fb.js).
   Les comptes et les sauvegardes sont stockés dans la base Redis liée au projet Vercel.
 
   Variable d'environnement lue (ajoutée par Vercel quand tu relies la base) :
@@ -437,12 +437,13 @@ module.exports = async function handler(req, res) {
     if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end(); }
     const url = new URL(req.url, 'http://x');
     if (req.method === 'GET') {
+      if (!url.searchParams.get('ping')) return send(res, 200, { ok: true, service: 'foot-boosters', v: 5 });
       if (url.searchParams.get('ping')) {
-        if (!HAS_REST && !TCP_URL) return send(res, 200, { ok: false, code: 'no_redis' });
+        if (!HAS_REST && !TCP_URL) return send(res, 200, { ok: false, code: 'no_redis', service: 'foot-boosters', v: 5 });
         try {
           const t0 = Date.now();
           await cmd('PING');
-          const info = { ok: true, ms: Date.now() - t0 };
+          const info = { ok: true, service: 'foot-boosters', v: 5, ms: Date.now() - t0 };
           try { // diagnostic : nombre de cartes sur le serveur et mémoire utilisée
             const [n, mem] = await run([['HLEN', 'fb:d:cards'], ['INFO', 'memory']]);
             info.cards = Number(n) || 0;
@@ -452,7 +453,7 @@ module.exports = async function handler(req, res) {
           } catch (e) { /* INFO peut être désactivé : sans importance */ }
           return send(res, 200, info);
         }
-        catch (e) { console.error('[api] ping Redis :', e && e.message); return send(res, 200, { ok: false, code: 'unavailable' }); }
+        catch (e) { console.error('[api] ping Redis :', e && e.message); return send(res, 200, { ok: false, code: 'unavailable', service: 'foot-boosters', v: 5 }); }
       }
       return send(res, 405, { code: 'method_not_allowed' });
     }
