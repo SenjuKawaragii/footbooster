@@ -372,6 +372,18 @@ async function handle(op, body, token, ip) {
       if (ids.length) { const r = await cmd('HMGET', 'fb:uname', ...ids); ids.forEach((id, i) => { if (r && r[i]) names[id] = r[i]; }); }
       return { names };
     }
+    case 'social': { // tout ce qui est « petit » d'un coup : joueurs, amis, collections, échanges, suppressions
+      const names = ['pub', 'pcol', 'fr', 'mk', 'out', 'rp', 'tomb'];
+      const res = await run(names.map(n => ['HGETALL', 'fb:d:' + n]));
+      const out = {}; let size = 0;
+      names.forEach((n, i) => {
+        const f = res[i] || [], o = {};
+        for (let k = 0; k + 1 < f.length; k += 2) { size += String(f[k + 1]).length; try { o[f[k]] = JSON.parse(f[k + 1]); } catch (e) { /* illisible : ignoré */ } }
+        out[n] = o;
+      });
+      if (size > 3500000) return { big: true };
+      return { social: out };
+    }
     case 'poll': return opPoll(body, uid);
     case 'purge': { // supprime les anciennes copies des cartes du site (identiques à celles du fichier du site)
       const items = isObj(body.items) ? body.items : {};
